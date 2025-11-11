@@ -363,8 +363,16 @@ def result_exists_for_hash(h: str) -> bool:
     return (DIR_INFORESULTS / f"{h}.json").exists() or (DIR_BAKINFORESULTS / f"{h}.json").exists()
 
 def result_exists_for_icon(icon_filename: str) -> bool:
-    """imageresults/<icon>.json 或 bakimageresults/<icon>.json 是否存在"""
-    return (DIR_IMAGERESULTS / f"{icon_filename}.json").exists() or (DIR_BAKIMAGERESULTS / f"{icon_filename}.json").exists()
+    """
+    imageresults 下的 JSON 命名为 <icon_hash>.json，
+    其中 icon_filename = <icon_hash>.<ext>（如 .png/.webp/...）。
+    """
+    if not icon_filename:
+        return False
+    base, _ = os.path.splitext(icon_filename)  # base = icon_hash
+    cand = DIR_IMAGERESULTS / f"{base}.json"
+    bak  = DIR_BAKIMAGERESULTS / f"{base}.json"
+    return cand.exists() or bak.exists()
 
 # ================== 批次状态与监控 ==================
 @dataclass
@@ -466,6 +474,8 @@ def tick_monitor():
         for h, icon in list(bs.remaining.items()):
             has_info  = result_exists_for_hash(h)
             has_image = result_exists_for_icon(icon)
+            if not (has_info and has_image):
+                print(f"[WAIT] {bs.name} hash={h} info={has_info} image={has_image} icon={icon}")
             if has_info and has_image:
                 finished_now.append(h)
         for h in finished_now:
