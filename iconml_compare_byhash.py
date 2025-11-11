@@ -98,19 +98,32 @@ def read_hashes_from_txt(txt: Path) -> List[str]:
             out.append(s)
     return out
 
-def stable_new_txts(dirpath: Path, known: Set[Path]) -> List[Path]:
+def stable_new_txts(dirpath: Path, seen_mtime: Dict[Path, float]) -> List[Path]:
+    """
+    返回需要新处理的 txt 列表。安全修复点：
+    - 对同名文件的“再次出现”与“覆盖写入”都能识别为新任务。
+    判定规则：
+      1) 先做 size 稳定性判定（等待 STABLE_WAIT），确保文件写入完成；
+      2) 如果文件不在 seen_mtime 中 => 新；
+      3) 如果文件在 seen_mtime 中，但 stat().st_mtime > seen_mtime[f] => 新。
+    """
     ret: List[Path] = []
     for f in dirpath.glob("*.txt"):
-        if f in known:
-            continue
         try:
             s1 = f.stat().st_size
+            t1 = f.stat().st_mtime
             time.sleep(STABLE_WAIT)
             s2 = f.stat().st_size
-            if s1 == s2 and s1 > 0:
-                ret.append(f)
+            t2 = f.stat().st_mtime
         except FileNotFoundError:
-            pass
+            # 写入过程中被移动/删除，下一轮再说
+            continue
+
+        # 写入稳定且非空
+        if s1 == s2 and s2 > 0:
+            last = seen_mtime.get(f)
+            if last is None or t2 > last:
+                ret.append(f)
     return ret
 
 def move_to_done(src: Path, dst_dir: Path):
@@ -487,7 +500,7 @@ def tick_monitor():
 
 # ================== 主循环 ==================
 def main():
-    print("=== Enhanced Non-blocking Request-By-Hash Watcher ===")
+    print("=== Enhanced Non-blocking Request-By-Hash Watcher (bug-fixed) ===")
     for d in [
         DIR_REQUEST_BY_HASH, DIR_REQUEST_BY_HASH_DONE,
         DIR_REQUEST_OUT, DIR_UPLOADIMAGES, DIR_DOWNLOAD,
@@ -498,17 +511,28 @@ def main():
     client = ensure_client()
     print(f"[INIT] client: {client}")
 
-    seen: Set[Path] = set()
+    # 用 mtime 追踪：修复“同名文件再次出现不再处理”的问题
+    seen_mtime: Dict[Path, float] = {}
     print(f"[WATCH] {DIR_REQUEST_BY_HASH.resolve()} (poll={POLL_INTERVAL}s)")
 
     while True:
         try:
+            # —— 清理 seen_mtime 中已不存在的文件（被移动到 done 后）——
+            seen_mtime = {p: t for p, t in seen_mtime.items() if p.exists()}
+
             # 发现新 txt：启动批次（不阻塞）
-            new_txts = stable_new_txts(DIR_REQUEST_BY_HASH, seen)
+            new_txts = stable_new_txts(DIR_REQUEST_BY_HASH, seen_mtime)
             if new_txts:
-                print(f"[DETECT] new txt: {[p.name for p in new_txts]}")
+                print(f"[DETECT] new/updated txt: {[p.name for p in new_txts]}")
+
             for txt in new_txts:
-                seen.add(txt)
+                # 记录当前 mtime（避免重复触发）
+                try:
+                    seen_mtime[txt] = txt.stat().st_mtime
+                except FileNotFoundError:
+                    # 被瞬时移动，下一轮再处理
+                    continue
+
                 try:
                     process_txt_start(txt, client)
                 except Exception as e:
@@ -520,11 +544,12 @@ def main():
                         pending_hashes=[],
                         info_only_hashes=[],
                         failed_hashes=[("BATCH_EXCEPTION", str(e))],
-                        all_hashes=read_hashes_from_txt(txt),
+                        all_hashes=read_hashes_from_txt(txt) if txt.exists() else [],
                         success_ready_pairs=[]
                     )
                     write_text(DIR_REQUEST_BY_HASH_DONE / f"{txt.stem}_summary.txt", summary)
-                    move_to_done(txt, DIR_REQUEST_BY_HASH_DONE)
+                    if txt.exists():
+                        move_to_done(txt, DIR_REQUEST_BY_HASH_DONE)
 
             # 统一监控所有活跃批次
             tick_monitor()
