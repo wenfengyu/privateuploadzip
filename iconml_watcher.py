@@ -6,66 +6,83 @@ import json
 import time
 import shutil
 import logging
-from typing import Dict, Optional, Set
+import threading
+from typing import Dict, Optional, Set, List
 import boto3
 from botocore.exceptions import ClientError
 
-# ============ 配置 ============
-BUCKET = "mr-dev-iconml-request"
+# =========================== 全局配置 ===========================
+BUCKET = "mr-iconml-dev"
 
-S3_PREFIX_REQUEST              = "iconml/request/"
-S3_PREFIX_IMAGES               = "iconml/images/"
-S3_PREFIX_PROCESSING           = "iconml/processing/"
-S3_PREFIX_PROCESSED            = "iconml/processed/"
-S3_PREFIX_RESULTS              = "iconml/inforesults/"
-S3_PREFIX_IMAGERESULTS         = "iconml/imageresults/"
-S3_PREFIX_ADDSAMPLES           = "iconml/addsamples/"
-S3_PREFIX_ADDSAMPLEPROCESSED   = "iconml/addsampleprocessed/"
-S3_PREFIX_REQUESTBYHASH        = "iconml/requestbyhash/"
-S3_PREFIX_REQUESTBYHASHDONE    = "iconml/requestbyhashdone/"
+# --- request 流水线(S3) ---
+S3_REQUEST        = "iconml/request/"
+S3_IMAGES         = "iconml/images/"
+S3_PROCESSING     = "iconml/processing/"
+S3_PROCESSED      = "iconml/processed/"
+S3_INFORESULTS    = "iconml/inforesults/"
+S3_IMAGERESULTS   = "iconml/imageresults/"
 
-LOCAL_DIR_REQUEST              = "request"
-LOCAL_DIR_UPLOADIMAGES         = "uploadimages"
-LOCAL_DIR_RESULTS              = "inforesults"
-LOCAL_DIR_IMAGERESULTS         = "imageresults"
-LOCAL_DIR_BAKRESULTS           = "bakresults"
-LOCAL_DIR_BAKIMAGERESULTS      = "bakimageresults"
-LOCAL_DIR_ADDSAMPLES           = "addsamples"
-LOCAL_DIR_ADDSAMPLEPROCESSED   = "addsampleprocessed"
-LOCAL_DIR_REQUESTBYHASH        = "requestbyhash"
-LOCAL_DIR_REQUESTBYHASHDONE    = "requestbyhashdone"
-LOCAL_DIR_BAKREQUESTBYHASHDONE = "bakrequestbyhashdone"
+# --- request 本地目录 ---
+DIR_REQUEST           = "request"
+DIR_UPLOADIMAGES      = "uploadimages"
+DIR_INFORESULTS       = "inforesults"
+DIR_IMAGERESULTS      = "imageresults"
+DIR_BAKINFORESULTS    = "bakinforesults"
+DIR_BAKIMAGERESULTS   = "bakimageresults"
 
-POLL_S3_INTERVAL    = 2.0
-POLL_LOCAL_INTERVAL = 1.0
-STABLE_WAIT_SEC     = 0.2
+# --- requestbyhash (RBH) 专用(S3) ---
+S3_RBH        = "iconml/requestbyhash/"
+S3_RBH_DONE   = "iconml/requestbyhashdone/"
 
-LOG_LEVEL = logging.INFO
+# --- requestbyhash (RBH) 本地目录 ---
+DIR_RBH         = "requestbyhash"
+DIR_RBH_DONE    = "requestbyhashdone"
+DIR_RBH_BAK     = "bakrequestbyhashdone"  # 归档 done 与源 txt
 
-# ============ 初始化 ============
+# --- addsample (AS) 专用(S3) ---
+S3_AS_IN       = "iconml/addsamples/"
+S3_AS_DONE     = "iconml/addsampleprocessed/"
+
+# --- addsample (AS) 本地目录 ---
+DIR_AS_IN      = "addsamples"            # 从 S3 下载的待处理 txt
+DIR_AS_DONE    = "addsampleprocessed"    # 你本地产出的处理完成 txt
+DIR_AS_BAK     = "bakaddsamples"         # 本地归档
+
+# --- 轮询间隔 ---
+POLL_S3_INTERVAL     = 2.0     # 扫 S3 的节奏
+POLL_LOCAL_INTERVAL  = 1.0     # 扫本地目录的节奏
+STABLE_WAIT_SEC      = 0.2     # 本地文件大小稳定检测
+LOG_LEVEL            = logging.INFO
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-s3 = boto3.client("s3")
 
+# 统一确保目录存在
 for d in [
-    LOCAL_DIR_REQUEST, LOCAL_DIR_UPLOADIMAGES,
-    LOCAL_DIR_RESULTS, LOCAL_DIR_IMAGERESULTS,
-    LOCAL_DIR_BAKRESULTS, LOCAL_DIR_BAKIMAGERESULTS,
-    LOCAL_DIR_ADDSAMPLES, LOCAL_DIR_ADDSAMPLEPROCESSED,
-    LOCAL_DIR_REQUESTBYHASH, LOCAL_DIR_REQUESTBYHASHDONE,
-    LOCAL_DIR_BAKREQUESTBYHASHDONE,
+    DIR_REQUEST, DIR_UPLOADIMAGES,
+    DIR_INFORESULTS, DIR_IMAGERESULTS,
+    DIR_BAKINFORESULTS, DIR_BAKIMAGERESULTS,
+    DIR_RBH, DIR_RBH_DONE, DIR_RBH_BAK,
+    DIR_AS_IN, DIR_AS_DONE, DIR_AS_BAK
 ]:
     os.makedirs(d, exist_ok=True)
 
-# ============ 工具函数 ============
-def s3_list_prefix(bucket: str, prefix: str):
-    """分页列出所有对象，防止超过1000漏项"""
-    keys = []
-    token = None
+
+# =========================== 公共 I/O 工具 ===========================
+def new_s3():
+    """每个线程独立创建 S3 client，避免跨线程复用连接。"""
+    return boto3.client("s3")
+
+def s3_list_prefix(s3, bucket: str, prefix: str) -> List[str]:
+    keys, token = [], None
     while True:
         params = {"Bucket": bucket, "Prefix": prefix}
         if token:
             params["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**params)
+        try:
+            resp = s3.list_objects_v2(**params)
+        except ClientError as e:
+            logging.error(f"s3_list_prefix error: {e} (prefix={prefix})")
+            return keys
         for c in resp.get("Contents", []):
             if not c["Key"].endswith("/"):
                 keys.append(c["Key"])
@@ -74,28 +91,35 @@ def s3_list_prefix(bucket: str, prefix: str):
         token = resp.get("NextContinuationToken")
     return keys
 
-def s3_download(bucket: str, key: str, local_path: str):
+def s3_head_last_modified_ts(s3, bucket: str, key: str) -> Optional[float]:
+    try:
+        resp = s3.head_object(Bucket=bucket, Key=key)
+        return resp["LastModified"].timestamp()
+    except ClientError:
+        return None
+
+def s3_download(s3, bucket: str, key: str, local_path: str):
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     s3.download_file(bucket, key, local_path)
     logging.info(f"S3 -> local: s3://{bucket}/{key} -> {local_path}")
 
-def s3_upload(bucket: str, key: str, local_path: str):
+def s3_upload(s3, bucket: str, key: str, local_path: str):
     s3.upload_file(local_path, bucket, key)
     logging.info(f"local -> S3: {local_path} -> s3://{bucket}/{key}")
 
-def s3_copy(bucket: str, src_key: str, dst_key: str):
+def s3_copy(s3, bucket: str, src_key: str, dst_key: str):
     s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src_key}, Key=dst_key)
     logging.info(f"S3 copy: s3://{bucket}/{src_key} -> s3://{bucket}/{dst_key}")
 
-def s3_delete(bucket: str, key: str):
+def s3_delete(s3, bucket: str, key: str):
     s3.delete_object(Bucket=bucket, Key=key)
     logging.info(f"S3 delete: s3://{bucket}/{key}")
 
-def s3_move(bucket: str, src_key: str, dst_key: str):
+def s3_move(s3, bucket: str, src_key: str, dst_key: str):
     if src_key == dst_key:
         return
-    s3_copy(bucket, src_key, dst_key)
-    s3_delete(bucket, src_key)
+    s3_copy(s3, bucket, src_key, dst_key)
+    s3_delete(s3, bucket, src_key)
 
 def file_is_stable(path: str, wait_sec: float = STABLE_WAIT_SEC) -> bool:
     try:
@@ -113,6 +137,7 @@ def move_local(src: str, dst_dir: str) -> str:
     if os.path.exists(dst):
         name, ext = os.path.splitext(base)
         dst = os.path.join(dst_dir, f"{name}_{int(time.time())}{ext}")
+    time.sleep(1.5)  # 给 FS 缓冲，避免紧跟读写抖动
     shutil.move(src, dst)
     logging.info(f"Local move: {src} -> {dst}")
     return dst
@@ -125,370 +150,429 @@ def load_json(path: str) -> Optional[dict]:
         logging.error(f"load_json error: {e} ({path})")
         return None
 
-def _head_last_modified_ts(bucket: str, key: str) -> Optional[float]:
-    try:
-        resp = s3.head_object(Bucket=bucket, Key=key)
-        return resp["LastModified"].timestamp()
-    except ClientError:
-        return None
 
-# ============ 队列 & 版本缓存 ============
-class Task:
-    def __init__(self, request_json_name: str, icon_filename: str, s3_processing_key: Optional[str]):
-        self.request_json_name = request_json_name
+# =========================== request 流水线（线程1） ===========================
+class RequestTask:
+    def __init__(self, req_json_name: str, icon_filename: str, s3_processing_key: str):
+        self.req_json_name = req_json_name
         self.icon_filename = icon_filename
-        self.icon_base_noext = os.path.splitext(icon_filename)[0] if icon_filename else ""
+        self.icon_base_noext = os.path.splitext(icon_filename)[0]
         self.s3_processing_key = s3_processing_key
         self.created_ts = time.time()
-
     def __repr__(self):
-        return f"Task(req={self.request_json_name}, icon={self.icon_filename})"
+        return f"Task(req={self.req_json_name}, icon={self.icon_filename})"
 
-# 队列
-pending_results: Dict[str, Task] = {}         # key: <request_json_name>
-pending_imageresults: Dict[str, Task] = {}    # key: <icon_base>
-pending_addsamples: Dict[str, str] = {}       # name -> s3_key
-pending_requestbyhash: Dict[str, str] = {}    # txt_name -> s3_key
-rbh_hash_to_txt: Dict[str, str] = {}          # <hash> -> txt_name
+class RequestWatcher(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.s3 = new_s3()
+        # 队列
+        self.pending_inforesults: Dict[str, RequestTask] = {}    # key: request_json_name
+        self.pending_imageresults: Dict[str, RequestTask] = {}   # key: icon_base
+        # S3 最近更新时间缓存（处理同名覆盖）
+        self.seen_s3_lm_request: Dict[str, float] = {}
+        # 兜底增量同步缓存
+        self.seen_local_inforesults_mtime: Dict[str, float] = {}
+        self.seen_local_imageresults_mtime: Dict[str, float] = {}
 
-# 关键：把“是否处理过”改为“是否更新”
-rbh_local_req_seen_mtime: Dict[str, float] = {}     # '<hash>.json' -> last_mtime（本地 request）
-addsampes_s3_seen_mtime: Dict[str, float] = {}      # 'file.txt' -> last_modified（S3 addsamples）
-
-# 兜底增量同步（本地结果目录）
-inforesults_seen_mtime: Dict[str, float] = {}       # '<hash>.json' mtime
-imageresults_seen_mtime: Dict[str, float] = {}      # '<icon_hash>.json' mtime
-
-# ============ 标准结果处理（队列驱动） ============
-def scan_and_handle_local_results():
-    """按 pending 队列上传 inforesults（保留，用于 requestbyhash 触发）"""
-    needed = set(pending_results.keys())
-    if not needed:
-        return
-    for fname in os.listdir(LOCAL_DIR_RESULTS):
-        if not fname.endswith(".json") or fname not in needed:
-            continue
-        local_path = os.path.join(LOCAL_DIR_RESULTS, fname)
-        if not file_is_stable(local_path):
-            continue
-        task = pending_results.get(fname)
-        if not task:
-            continue
-        s3_key = S3_PREFIX_RESULTS + fname
-        try:
-            s3_upload(BUCKET, s3_key, local_path)
-        except ClientError as e:
-            logging.error(f"Upload results failed: {local_path} -> {s3_key}, err={e}")
-            continue
-        if task.s3_processing_key:
-            try:
-                s3_move(BUCKET, task.s3_processing_key, S3_PREFIX_PROCESSED + fname)
-            except ClientError as e:
-                logging.error(f"Move processing -> processed failed: {task.s3_processing_key}, err={e}")
-        move_local(local_path, LOCAL_DIR_BAKRESULTS)
-        pending_results.pop(fname, None)
-        logging.info(f"[DEQUEUE] results done for {fname}")
-
-def scan_and_handle_local_imageresults():
-    """按 pending 队列上传 imageresults（保留，用于 requestbyhash 触发）"""
-    needed = set(pending_imageresults.keys())
-    if not needed:
-        return
-    for fname in os.listdir(LOCAL_DIR_IMAGERESULTS):
-        if not fname.endswith(".json"):
-            continue
-        base = os.path.splitext(fname)[0]
-        if base not in needed:
-            continue
-        local_path = os.path.join(LOCAL_DIR_IMAGERESULTS, fname)
-        if not file_is_stable(local_path):
-            continue
-        task = pending_imageresults.get(base)
-        if not task:
-            continue
-        s3_key = S3_PREFIX_IMAGERESULTS + fname
-        try:
-            s3_upload(BUCKET, s3_key, local_path)
-        except ClientError as e:
-            logging.error(f"Upload imageresults failed: {local_path} -> {s3_key}, err={e}")
-            continue
-        move_local(local_path, LOCAL_DIR_BAKIMAGERESULTS)
-        pending_imageresults.pop(base, None)
-        logging.info(f"[DEQUEUE] imageresults done for {fname}")
-
-# ============ 兜底：本地 inforesults/imageresults 增量同步 ============
-def _sync_inforesults_incremental():
-    for fname in os.listdir(LOCAL_DIR_RESULTS):
-        if not fname.endswith(".json"):
-            continue
-        fpath = os.path.join(LOCAL_DIR_RESULTS, fname)
-        if not file_is_stable(fpath):
-            continue
-        try:
-            mtime = os.path.getmtime(fpath)
-        except FileNotFoundError:
-            continue
-        old = inforesults_seen_mtime.get(fname, 0.0)
-        if mtime <= old:
-            continue
-        # 新或更新 -> 直接上传并归档
-        s3_key = S3_PREFIX_RESULTS + fname
-        try:
-            s3_upload(BUCKET, s3_key, fpath)
-        except ClientError as e:
-            logging.error(f"[RESULTS][INCR] upload failed: {fname}, err={e}")
-            continue
-        move_local(fpath, LOCAL_DIR_BAKRESULTS)
-        inforesults_seen_mtime[fname] = mtime
-        # 若本条在 pending 中，也顺便出队
-        if fname in pending_results:
-            pending_results.pop(fname, None)
-        logging.info(f"[RESULTS][INCR] uploaded (untracked): {fname}")
-
-def _sync_imageresults_incremental():
-    for fname in os.listdir(LOCAL_DIR_IMAGERESULTS):
-        if not fname.endswith(".json"):
-            continue
-        fpath = os.path.join(LOCAL_DIR_IMAGERESULTS, fname)
-        if not file_is_stable(fpath):
-            continue
-        try:
-            mtime = os.path.getmtime(fpath)
-        except FileNotFoundError:
-            continue
-        old = imageresults_seen_mtime.get(fname, 0.0)
-        if mtime <= old:
-            continue
-        # 新或更新 -> 直接上传并归档
-        s3_key = S3_PREFIX_IMAGERESULTS + fname
-        try:
-            s3_upload(BUCKET, s3_key, fpath)
-        except ClientError as e:
-            logging.error(f"[IMAGERES][INCR] upload failed: {fname}, err={e}")
-            continue
-        move_local(fpath, LOCAL_DIR_BAKIMAGERESULTS)
-        imageresults_seen_mtime[fname] = mtime
-        # 若在 pending 中，也顺便出队
-        base = os.path.splitext(fname)[0]
-        if base in pending_imageresults:
-            pending_imageresults.pop(base, None)
-        logging.info(f"[IMAGERES][INCR] uploaded (untracked): {fname}")
-
-# ============ addsamples 逻辑（支持同名覆盖更新） ============
-def handle_new_addsamples_from_s3():
-    keys = s3_list_prefix(BUCKET, S3_PREFIX_ADDSAMPLES)
-    for key in keys:
-        if not key.endswith(".txt"):
-            continue
-        name = os.path.basename(key)
-        local_path = os.path.join(LOCAL_DIR_ADDSAMPLES, name)
-
-        lm = _head_last_modified_ts(BUCKET, key)
-        if lm is None:
-            continue
-        old = addsampes_s3_seen_mtime.get(name, 0.0)
-
-        # S3 “第一次见到”或“LastModified 变新” -> 重新下载 + 重新入队
-        if lm > old or not os.path.exists(local_path):
-            try:
-                s3_download(BUCKET, key, local_path)
-            except ClientError as e:
-                logging.error(f"Download addsample TXT failed: {key}, err={e}")
+    def _handle_new_request_from_s3(self):
+        keys = s3_list_prefix(self.s3, BUCKET, S3_REQUEST)
+        for key in keys:
+            if not key.endswith(".json"):
                 continue
-            addsampes_s3_seen_mtime[name] = lm
-            pending_addsamples[name] = key
-            logging.info(f"[ENQUEUE][ADDSAMPLE] {name} (lm={lm})")
+            name = os.path.basename(key)
+            local_path = os.path.join(DIR_REQUEST, name)
 
-def scan_and_handle_local_addsampleprocessed():
-    if not pending_addsamples:
-        return
-    need_names = set(pending_addsamples.keys())
-    for fname in os.listdir(LOCAL_DIR_ADDSAMPLEPROCESSED):
-        if not fname.endswith(".txt") or fname not in need_names:
-            continue
-        local_path = os.path.join(LOCAL_DIR_ADDSAMPLEPROCESSED, fname)
-        if not file_is_stable(local_path):
-            continue
-        s3_src_key = pending_addsamples.get(fname)
-        s3_dst_key = S3_PREFIX_ADDSAMPLEPROCESSED + fname
-        try:
-            s3_move(BUCKET, s3_src_key, s3_dst_key)
-        except ClientError as e:
-            logging.error(f"Move addsample failed: {s3_src_key}, err={e}")
-            continue
-        pending_addsamples.pop(fname, None)
-        logging.info(f"[DEQUEUE][ADDSAMPLE] done for {fname}")
+            s3lm = s3_head_last_modified_ts(self.s3, BUCKET, key)
+            oldlm = self.seen_s3_lm_request.get(name, 0.0)
+            local_mtime = os.path.getmtime(local_path) if os.path.exists(local_path) else 0.0
 
-# ============ requestbyhash 逻辑 ============
-def _read_hashes_from_txt(local_path: str) -> Set[str]:
-    out = set()
-    try:
-        with open(local_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
+            # 首次或 S3 更新 -> 下载
+            if (s3lm is not None) and (not os.path.exists(local_path) or s3lm > local_mtime + 1.0 or s3lm > oldlm + 1.0):
+                try:
+                    s3_download(self.s3, BUCKET, key, local_path)
+                    self.seen_s3_lm_request[name] = s3lm or time.time()
+                except ClientError as e:
+                    logging.error(f"[REQ] download request failed: {key}, {e}")
                     continue
-                out.add(s)
-    except Exception as e:
-        logging.error(f"read hashes error: {e} ({local_path})")
-    return out
 
-def _need_redownload(bucket: str, key: str, local_path: str) -> bool:
-    """S3 文件比本地更新就重新下载"""
-    lm = _head_last_modified_ts(bucket, key)
-    if lm is None:
-        return False
-    if not os.path.exists(local_path):
-        return True
-    local_mtime = os.path.getmtime(local_path)
-    return (lm - local_mtime) > 1.0
-
-def handle_new_requestbyhash_from_s3():
-    keys = s3_list_prefix(BUCKET, S3_PREFIX_REQUESTBYHASH)
-    for key in keys:
-        if not key.endswith(".txt"):
-            continue
-        name = os.path.basename(key)
-        local_path = os.path.join(LOCAL_DIR_REQUESTBYHASH, name)
-
-        # 覆盖更新 -> 重新下载（或首次下载）
-        if _need_redownload(BUCKET, key, local_path):
+            # S3 移动到 processing（幂等）
+            processing_key = S3_PROCESSING + name
             try:
-                s3_download(BUCKET, key, local_path)
+                s3_move(self.s3, BUCKET, key, processing_key)
             except ClientError as e:
-                logging.error(f"Download requestbyhash TXT failed: {key}, err={e}")
+                logging.warning(f"[REQ] move request->processing warn: {e}")
+
+            data = load_json(local_path)
+            if not data:
+                continue
+            icon_filename = data.get("icon_filename")
+            if not icon_filename:
+                logging.error(f"[REQ] json missing icon_filename: {local_path}")
                 continue
 
-        # 解析 hash -> txt 映射（覆盖写会被刷新）
-        hashes = _read_hashes_from_txt(local_path)
-        for h in hashes:
-            rbh_hash_to_txt[h] = name
+            # 下载 icon 到本地（若不存在）
+            icon_key = S3_IMAGES + icon_filename
+            icon_local = os.path.join(DIR_UPLOADIMAGES, icon_filename)
+            if not os.path.exists(icon_local):
+                try:
+                    s3_download(self.s3, BUCKET, icon_key, icon_local)
+                except ClientError as e:
+                    logging.warning(f"[REQ] download icon warn (non-fatal): {e}")
 
-        if name not in pending_requestbyhash:
-            pending_requestbyhash[name] = key
-            logging.info(f"[ENQUEUE][RBH] {name} (hashes={len(hashes)})")
+            t = RequestTask(name, icon_filename, processing_key)
+            self.pending_inforesults[name] = t
+            self.pending_imageresults[t.icon_base_noext] = t
+            logging.info(f"[ENQUEUE][REQ] {t}")
 
-def _try_enqueue_request_task_from_local_request_json():
-    """
-    监听本地 request/<hash>.json：
-    - 只托管那些来自 requestbyhash 的 <hash>（在 rbh_hash_to_txt 里）
-    - 以 mtime 为准：第一次或更新后都会再次入队
-    """
-    for fname in os.listdir(LOCAL_DIR_REQUEST):
-        if not fname.endswith(".json"):
-            continue
-        base = os.path.splitext(fname)[0]
-        if base not in rbh_hash_to_txt:
-            continue
+    def _scan_local_inforesults(self):
+        if not self.pending_inforesults:
+            return
+        need = set(self.pending_inforesults.keys())
+        for fname in os.listdir(DIR_INFORESULTS):
+            if not fname.endswith(".json") or fname not in need:
+                continue
+            fpath = os.path.join(DIR_INFORESULTS, fname)
+            if not file_is_stable(fpath):
+                continue
+            t = self.pending_inforesults.get(fname)
+            if not t:
+                continue
 
-        local_req_path = os.path.join(LOCAL_DIR_REQUEST, fname)
-        if not file_is_stable(local_req_path):
-            continue
-
-        try:
-            mtime = os.path.getmtime(local_req_path)
-        except FileNotFoundError:
-            continue
-        old = rbh_local_req_seen_mtime.get(fname, 0.0)
-        if mtime <= old:
-            continue
-
-        data = load_json(local_req_path)
-        if not data:
-            continue
-
-        icon_filename = data.get("icon_filename", "") or ""
-        t = Task(request_json_name=fname, icon_filename=icon_filename, s3_processing_key=None)
-        pending_results[fname] = t
-        if icon_filename:
-            icon_base = os.path.splitext(icon_filename)[0]
-            pending_imageresults[icon_base] = t
-
-        rbh_local_req_seen_mtime[fname] = mtime
-        logging.info(f"[ENQUEUE][RBH] {base} -> queues (icon={icon_filename}, mtime={mtime})")
-
-def scan_and_handle_local_requestbyhashdone():
-    """
-    当本地 requestbyhashdone/<name>.txt 出现（稳定）：
-      1) 上传到 S3 requestbyhashdone/
-      2) 删除 S3 requestbyhash/<name>.txt（若还在）
-      3) 本地 done/<name>.txt 归档到 bakrequestbyhashdone/
-      4) 同名源 requestbyhash/<name>.txt 也归档
-      5) 清理映射和已见记录
-    """
-    if not pending_requestbyhash:
-        return
-    need_names = set(pending_requestbyhash.keys())
-    for fname in os.listdir(LOCAL_DIR_REQUESTBYHASHDONE):
-        if not fname.endswith(".txt") or fname not in need_names:
-            continue
-        local_path = os.path.join(LOCAL_DIR_REQUESTBYHASHDONE, fname)
-        if not file_is_stable(local_path):
-            continue
-
-        s3_dst_key = S3_PREFIX_REQUESTBYHASHDONE + fname
-        s3_src_key = pending_requestbyhash.get(fname)
-
-        try:
-            s3_upload(BUCKET, s3_dst_key, local_path)
-        except ClientError as e:
-            logging.error(f"Upload RBH done failed: {fname}, err={e}")
-            continue
-
-        if s3_src_key:
             try:
-                s3_delete(BUCKET, s3_src_key)
+                s3_upload(self.s3, BUCKET, S3_INFORESULTS + fname, fpath)
             except ClientError as e:
-                logging.warning(f"Delete src warn: {s3_src_key}, err={e}")
+                logging.error(f"[REQ] upload inforesults failed: {e}")
+                continue
+            try:
+                s3_move(self.s3, BUCKET, t.s3_processing_key, S3_PROCESSED + fname)
+            except ClientError as e:
+                logging.warning(f"[REQ] processing->processed warn: {e}")
 
-        move_local(local_path, LOCAL_DIR_BAKREQUESTBYHASHDONE)
+            move_local(fpath, DIR_BAKINFORESULTS)
+            self.pending_inforesults.pop(fname, None)
+            logging.info(f"[DEQUEUE][REQ] inforesults {fname}")
 
-        # 同名源 requestbyhash/<name>.txt 也归档（如果还在）
-        src_txt = os.path.join(LOCAL_DIR_REQUESTBYHASH, fname)
-        if os.path.exists(src_txt):
-            move_local(src_txt, LOCAL_DIR_BAKREQUESTBYHASHDONE)
+    def _scan_local_imageresults(self):
+        if not self.pending_imageresults:
+            return
+        need = set(self.pending_imageresults.keys())
+        for fname in os.listdir(DIR_IMAGERESULTS):
+            if not fname.endswith(".json"):
+                continue
+            base = os.path.splitext(fname)[0]
+            if base not in need:
+                continue
+            fpath = os.path.join(DIR_IMAGERESULTS, fname)
+            if not file_is_stable(fpath):
+                continue
+            t = self.pending_imageresults.get(base)
+            if not t:
+                continue
 
-        # 清理映射与已见
-        pending_requestbyhash.pop(fname, None)
-        batch_hashes = [h for h, tname in list(rbh_hash_to_txt.items()) if tname == fname]
-        for h in batch_hashes:
-            rbh_hash_to_txt.pop(h, None)
-            rbh_local_req_seen_mtime.pop(f"{h}.json", None)
+            try:
+                s3_upload(self.s3, BUCKET, S3_IMAGERESULTS + fname, fpath)
+            except ClientError as e:
+                logging.error(f"[REQ] upload imageresults failed: {e}")
+                continue
+            try:
+                s3_delete(self.s3, BUCKET, S3_IMAGES + t.icon_filename)
+            except ClientError as e:
+                logging.warning(f"[REQ] delete icon warn: {e}")
 
-        logging.info(f"[DEQUEUE][RBH] done for {fname}")
+            move_local(fpath, DIR_BAKIMAGERESULTS)
+            self.pending_imageresults.pop(base, None)
+            logging.info(f"[DEQUEUE][REQ] imageresults {fname}")
 
-# ============ 主循环 ============
-def main_loop():
-    logging.info("=== Start watcher (addsampes + requestbyhash + results sync, mtime-safe) ===")
-    while True:
+    # 兜底：任何新/更新的本地结果，都直接上传（不依赖队列）
+    def _sync_inforesults_incremental(self):
+        for fname in os.listdir(DIR_INFORESULTS):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(DIR_INFORESULTS, fname)
+            if not file_is_stable(fpath):
+                continue
+            m = os.path.getmtime(fpath)
+            if m <= self.seen_local_inforesults_mtime.get(fname, 0.0):
+                continue
+            try:
+                s3_upload(self.s3, BUCKET, S3_INFORESULTS + fname, fpath)
+            except ClientError as e:
+                logging.error(f"[REQ][INCR] upload inforesults failed: {e}")
+                continue
+            move_local(fpath, DIR_BAKINFORESULTS)
+            self.seen_local_inforesults_mtime[fname] = m
+            self.pending_inforesults.pop(fname, None)
+            logging.info(f"[REQ][INCR] inforesults {fname}")
+
+    def _sync_imageresults_incremental(self):
+        for fname in os.listdir(DIR_IMAGERESULTS):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(DIR_IMAGERESULTS, fname)
+            if not file_is_stable(fpath):
+                continue
+            m = os.path.getmtime(fpath)
+            if m <= self.seen_local_imageresults_mtime.get(fname, 0.0):
+                continue
+            try:
+                s3_upload(self.s3, BUCKET, S3_IMAGERESULTS + fname, fpath)
+            except ClientError as e:
+                logging.error(f"[REQ][INCR] upload imageresults failed: {e}")
+                continue
+            move_local(fpath, DIR_BAKIMAGERESULTS)
+            self.seen_local_imageresults_mtime[fname] = m
+            self.pending_imageresults.pop(os.path.splitext(fname)[0], None)
+            logging.info(f"[REQ][INCR] imageresults {fname}")
+
+    def run(self):
+        logging.info("=== RequestWatcher started ===")
+        while True:
+            try:
+                self._handle_new_request_from_s3()
+                self._scan_local_inforesults()
+                self._scan_local_imageresults()
+                # 兜底增量
+                self._sync_inforesults_incremental()
+                self._sync_imageresults_incremental()
+                time.sleep(POLL_LOCAL_INTERVAL)
+                time.sleep(POLL_S3_INTERVAL)
+            except Exception as e:
+                logging.exception(f"[REQ] loop error: {e}")
+                time.sleep(1.0)
+
+
+# =========================== requestbyhash 流水线（线程2） ===========================
+class RBHWatcher(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.s3 = new_s3()
+        # 记录批次 -> {hash集合}
+        self.batches: Dict[str, Set[str]] = {}
+        # S3 TXT 的 LastModified 记忆（支持同名覆盖）
+        self.rbh_seen_s3_lm: Dict[str, float] = {}
+
+    def _read_hashes(self, path: str) -> Set[str]:
+        out = set()
         try:
-            # 1) S3 拉取 / 入队（支持同名覆盖更新）
-            handle_new_addsamples_from_s3()
-            handle_new_requestbyhash_from_s3()
-
-            # 2) 本地 request/<hash>.json 入队（支持同名覆盖更新）
-            _try_enqueue_request_task_from_local_request_json()
-
-            # 3) 按队列上传（原有）
-            scan_and_handle_local_results()
-            scan_and_handle_local_imageresults()
-
-            # 4) 兜底增量上传（不依赖队列，确保“任何新/更新的结果”都能上传并归档）
-            _sync_inforesults_incremental()
-            _sync_imageresults_incremental()
-
-            # 5) 其它收尾
-            scan_and_handle_local_addsampleprocessed()
-            scan_and_handle_local_requestbyhashdone()
-
-            time.sleep(POLL_LOCAL_INTERVAL)
-            time.sleep(POLL_S3_INTERVAL)
-        except KeyboardInterrupt:
-            logging.info("KeyboardInterrupt, exit.")
-            break
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    out.add(s)
         except Exception as e:
-            logging.exception(f"main_loop error: {e}")
-            time.sleep(1.0)
+            logging.error(f"[RBH] read hashes error: {e} ({path})")
+        return out
+
+    def _pull_batches_from_s3(self):
+        keys = s3_list_prefix(self.s3, BUCKET, S3_RBH)
+        for key in keys:
+            if not key.endswith(".txt"):
+                continue
+            name = os.path.basename(key)
+            local = os.path.join(DIR_RBH, name)
+            s3lm = s3_head_last_modified_ts(self.s3, BUCKET, key)
+            old = self.rbh_seen_s3_lm.get(name, 0.0)
+            local_m = os.path.getmtime(local) if os.path.exists(local) else 0.0
+
+            if (s3lm is not None) and (not os.path.exists(local) or s3lm > local_m + 1.0 or s3lm > old + 1.0):
+                try:
+                    s3_download(self.s3, BUCKET, key, local)
+                    self.rbh_seen_s3_lm[name] = s3lm or time.time()
+                    self.batches[name] = self._read_hashes(local)
+                    logging.info(f"[RBH] pull {name}, hashes={len(self.batches[name])}")
+                except Exception as e:
+                    logging.error(f"[RBH] download failed: {e}")
+
+    def _info_exists_locally(self, h: str) -> bool:
+        return os.path.exists(os.path.join(DIR_INFORESULTS, f"{h}.json"))
+
+    def _icon_base_from_request(self, h: str) -> Optional[str]:
+        """尝试从本地 request/<h>.json 读取 icon_filename -> icon_hash(base)。若无则返回 None。"""
+        j = os.path.join(DIR_REQUEST, f"{h}.json")
+        if not os.path.exists(j):
+            return None
+        data = load_json(j)
+        if not data:
+            return None
+        icon_filename = data.get("icon_filename") or ""
+        base, _ = os.path.splitext(icon_filename)
+        return base or None
+
+    def _image_exists_for_hash(self, h: str) -> bool:
+        """若能解析出 icon_base，就检查 imageresults/<icon_base>.json；否则认为图像未就绪。"""
+        base = self._icon_base_from_request(h)
+        if not base:
+            return False
+        return os.path.exists(os.path.join(DIR_IMAGERESULTS, f"{base}.json"))
+
+    def _all_done_for_batch(self, hashes: Set[str]) -> (List[str], List[str]):
+        done, pending = [], []
+        for h in hashes:
+            info_ok = self._info_exists_locally(h)
+            img_ok  = self._image_exists_for_hash(h)
+            if info_ok and img_ok:
+                done.append(h)
+            else:
+                pending.append(h)
+        return done, pending
+
+    def _write_summary(self, local_txt_name: str, done: List[str], pending: List[str], all_hashes: Set[str]) -> str:
+        lines = []
+        lines.append(f"SUMMARY FOR: {local_txt_name}")
+        lines.append(f"TOTAL HASHES: {len(all_hashes)}")
+        lines.append("")
+        lines.append(f"[SUCCESS COMPLETED] ({len(done)})")
+        for h in done: lines.append(f"  - {h}")
+        lines.append("")
+        lines.append(f"[PENDING_OR_TIMEOUT] ({len(pending)})")
+        for h in pending: lines.append(f"  - {h}")
+        lines.append("")
+        lines.append("NOTE:")
+        lines.append("  SUCCESS COMPLETED: inforesults/<hash>.json & imageresults/<icon_hash>.json both present.")
+        lines.append("  PENDING_OR_TIMEOUT: missing either inforesult or imageresult (或 request/<hash>.json 缺失，无法确定 icon_hash)。")
+        return "\n".join(lines)
+
+    def _try_finalize_batches(self):
+        for name, hashes in list(self.batches.items()):
+            done, pending = self._all_done_for_batch(hashes)
+            if pending:
+                logging.info(f"[RBH] wait {name}: completed={len(done)} pending={len(pending)}")
+                continue
+            # 全部完成 -> 生成同名 done.txt
+            out = self._write_summary(name, done, pending, hashes)
+            local_done = os.path.join(DIR_RBH_DONE, name)  # 与源同名
+            with open(local_done, "w", encoding="utf-8") as f:
+                f.write(out)
+
+            try:
+                s3_upload(self.s3, BUCKET, S3_RBH_DONE + name, local_done)
+            except Exception as e:
+                logging.error(f"[RBH] upload done failed: {e}")
+                continue
+
+            move_local(local_done, DIR_RBH_BAK)
+            src = os.path.join(DIR_RBH, name)
+            if os.path.exists(src):
+                move_local(src, DIR_RBH_BAK)
+            self.batches.pop(name, None)
+            logging.info(f"[RBH] finalized {name}")
+
+    def run(self):
+        logging.info("=== RBHWatcher started ===")
+        while True:
+            try:
+                self._pull_batches_from_s3()
+                self._try_finalize_batches()
+                time.sleep(POLL_LOCAL_INTERVAL)
+                time.sleep(POLL_S3_INTERVAL)
+            except Exception as e:
+                logging.exception(f"[RBH] loop error: {e}")
+                time.sleep(1.0)
+
+
+# =========================== addsample 流水线（线程3） ===========================
+class AddSampleWatcher(threading.Thread):
+    """
+    addsample 逻辑：
+      - 拉取 S3 iconml/addsamples/*.txt 到本地 addsamples/   （支持同名覆盖：用 LastModified 判定）
+      - 你处理完毕后在本地 addSampleProcessed/ 产出同名 .txt
+      - 监控到后：
+            * 上传到 S3 iconml/addsampleprocessed/
+            * 删除/清理 S3 源 addsamples/<name>.txt
+            * 本地两个 txt 都归档到 bakaddsamples/
+    """
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.s3 = new_s3()
+        self.seen_s3_lm: Dict[str, float] = {}      # name -> s3 LastModified
+        self.pending_names: Dict[str, str] = {}     # name -> s3_source_key
+
+    def _pull_from_s3(self):
+        keys = s3_list_prefix(self.s3, BUCKET, S3_AS_IN)
+        for key in keys:
+            if not key.endswith(".txt"):
+                continue
+            name = os.path.basename(key)
+            local = os.path.join(DIR_AS_IN, name)
+            s3lm = s3_head_last_modified_ts(self.s3, BUCKET, key)
+            old  = self.seen_s3_lm.get(name, 0.0)
+            local_m = os.path.getmtime(local) if os.path.exists(local) else 0.0
+
+            if (s3lm is not None) and (not os.path.exists(local) or s3lm > local_m + 1.0 or s3lm > old + 1.0):
+                try:
+                    s3_download(self.s3, BUCKET, key, local)
+                    self.seen_s3_lm[name] = s3lm or time.time()
+                    self.pending_names[name] = key
+                    logging.info(f"[AS] pull {name}")
+                except ClientError as e:
+                    logging.error(f"[AS] download failed: {e}")
+
+    def _scan_local_done(self):
+        if not self.pending_names:
+            return
+        need = set(self.pending_names.keys())
+        for fname in os.listdir(DIR_AS_DONE):
+            if not fname.endswith(".txt") or fname not in need:
+                continue
+            fpath = os.path.join(DIR_AS_DONE, fname)
+            if not file_is_stable(fpath):
+                continue
+            s3_dst = S3_AS_DONE + fname
+            s3_src = self.pending_names.get(fname)
+
+            # 上传处理结果
+            try:
+                s3_upload(self.s3, BUCKET, s3_dst, fpath)
+            except ClientError as e:
+                logging.error(f"[AS] upload done failed: {e}")
+                continue
+
+            # 删除 S3 源（或也可改成 move 到一个历史目录）
+            if s3_src:
+                try:
+                    s3_delete(self.s3, BUCKET, s3_src)
+                except ClientError as e:
+                    logging.warning(f"[AS] delete source warn: {e}")
+
+            # 本地归档：done 与 in 各归档一份
+            move_local(fpath, DIR_AS_BAK)
+            src_txt = os.path.join(DIR_AS_IN, fname)
+            if os.path.exists(src_txt):
+                move_local(src_txt, DIR_AS_BAK)
+
+            self.pending_names.pop(fname, None)
+            logging.info(f"[AS] finalized {fname}")
+
+    def run(self):
+        logging.info("=== AddSampleWatcher started ===")
+        while True:
+            try:
+                self._pull_from_s3()
+                self._scan_local_done()
+                time.sleep(POLL_LOCAL_INTERVAL)
+                time.sleep(POLL_S3_INTERVAL)
+            except Exception as e:
+                logging.exception(f"[AS] loop error: {e}")
+                time.sleep(1.0)
+
+
+# =========================== 主函数：启动三个线程 ===========================
+def main():
+    req = RequestWatcher()
+    rbh = RBHWatcher()
+    ads = AddSampleWatcher()
+    req.start()
+    rbh.start()
+    ads.start()
+    logging.info("=== merged watcher running (request + requestbyhash + addsample) ===")
+    # 主线程保持存活
+    try:
+        while True:
+            time.sleep(60.0)
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt, exit.")
 
 if __name__ == "__main__":
-    main_loop()
+    main()
