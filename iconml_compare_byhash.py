@@ -1,43 +1,52 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import sys
 import time
+import json
 import shutil
 import hashlib
 import zipfile
-import struct
 import subprocess
 from pathlib import Path
-from typing import List, Set, Optional
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Set
 
-# ==== 依赖：aapt2 + devid ====
-# ./aapt2 需在同目录下或按需修改 AAPT2_PATH
+# ================== 外部依赖 ==================
+# 1) aapt2 可执行文件路径（与脚本同目录或自行修改）
 AAPT2_PATH = "./aapt2"
-
-# devid.py 需提供 getsignsha1(apk_path) -> (devid, certsha1)
+# 2) 下载客户端：./tool/linux_client --hash <h> --outdir ./download
+CLIENT_PATH = Path("./tool/linux_client")
+# 3) devid.py：必须提供 getsignsha1(apk_path) -> (devid, certsha1)
 from devid import getsignsha1
 
-# ==== 下载客户端 ====
-CLIENT_PATH = Path("./tool/linux_client")
+# ================== 本地目录配置 ==================
+DIR_REQUEST_BY_HASH       = Path("./requestbyhash")
+DIR_REQUEST_BY_HASH_DONE  = Path("./requestbyhashdone")
+DIR_REQUEST_OUT           = Path("./request")          # 生成的 request/<hash>.json
+DIR_UPLOADIMAGES          = Path("./uploadimages")     # 提取出的 icon 命名为 sha256.ext
+DIR_DOWNLOAD              = Path("./download")         # 临时下载包
+# 结果观察目录（由你的其他服务生成）
+DIR_INFORESULTS           = Path("./inforesults")
+DIR_BAKINFORESULTS        = Path("./bakinforesults")
+DIR_IMAGERESULTS          = Path("./imageresults")
+DIR_BAKIMAGERESULTS       = Path("./bakimageresults")
 
-# ==== 目录配置 ====
-DIR_REQUEST_BY_HASH     = Path("./requestbyhash")
-DIR_REQUEST_BY_HASH_DONE= Path("./requestbyhashdone")
-DIR_REQUEST_OUT         = Path("./request")
-DIR_UPLOADIMAGES        = Path("./uploadimages")
-DIR_DOWNLOAD            = Path("./download")
+# ================== 轮询与超时 ==================
+POLL_INTERVAL      = 3.0    # 主循环轮询间隔
+STABLE_WAIT        = 0.2    # txt 文件稳定判定
+MAX_WAIT_SECONDS   = 1800   # 每批最多等待 30 分钟（根据需要调整）
 
-POLL_INTERVAL = 3.0  # 轮询 requestbyhash/ 的间隔（秒）
-STABLE_WAIT   = 0.2  # 本地文件大小稳定检查
-
-# ----------------- 实用函数 -----------------
+# ================== 工具函数 ==================
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def run_cmd(cmd: List[str]) -> str:
-    """运行命令，返回 stdout（utf-8, replace 错误字符）"""
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, encoding="utf-8", errors="replace")
-    return res.stdout
+    """运行外部命令，返回 stdout（utf-8, errors=replace）"""
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True, encoding="utf-8", errors="replace")
+    return r.stdout
 
 def ensure_client() -> Path:
     client = CLIENT_PATH.resolve()
@@ -51,16 +60,16 @@ def ensure_client() -> Path:
 
 def run_client_download(client: Path, h: str, outdir: Path) -> Path:
     """
-    调用下载器：保存至 outdir/{hash}.bin，若不存在则找 {hash}.zip 或 {hash}.*
+    调用下载器：保存至 outdir/{hash}.bin；若不存在则找 {hash}.zip 或 {hash}.*
     """
     ensure_dir(outdir)
     cmd = [str(client), "--hash", h, "--outdir", str(outdir)]
     print("[DL ]", " ".join(cmd))
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        print(f"[ERR] download failed: hash={h}, rc={res.returncode}")
-        if res.stdout: print("stdout:\n", res.stdout)
-        if res.stderr: print("stderr:\n", res.stderr)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"[ERR] download failed: hash={h}, rc={r.returncode}")
+        if r.stdout: print("stdout:\n", r.stdout)
+        if r.stderr: print("stderr:\n", r.stderr)
         raise RuntimeError(f"download failed: {h}")
 
     p_bin = outdir / f"{h}.bin"
@@ -72,25 +81,25 @@ def run_client_download(client: Path, h: str, outdir: Path) -> Path:
         print(f"[DL ] {h}.bin not found, using: {p_zip.name}")
         return p_zip.resolve()
 
-    candidates = list(outdir.glob(f"{h}.*"))
-    if candidates:
-        print(f"[DL ] use candidate: {candidates[0].name}")
-        return candidates[0].resolve()
+    cands = list(outdir.glob(f"{h}.*"))
+    if cands:
+        print(f"[DL ] using candidate: {cands[0].name}")
+        return cands[0].resolve()
 
     raise FileNotFoundError(f"downloaded file not found for hash={h}")
 
 def read_hashes_from_txt(txt: Path) -> List[str]:
-    hs = []
+    out: List[str] = []
     with txt.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            hs.append(s)
-    return hs
+            out.append(s)
+    return out
 
 def stable_new_txts(dirpath: Path, known: Set[Path]) -> List[Path]:
-    out = []
+    ret: List[Path] = []
     for f in dirpath.glob("*.txt"):
         if f in known:
             continue
@@ -99,10 +108,10 @@ def stable_new_txts(dirpath: Path, known: Set[Path]) -> List[Path]:
             time.sleep(STABLE_WAIT)
             s2 = f.stat().st_size
             if s1 == s2 and s1 > 0:
-                out.append(f)
+                ret.append(f)
         except FileNotFoundError:
             pass
-    return out
+    return ret
 
 def move_to_done(src: Path, dst_dir: Path):
     ensure_dir(dst_dir)
@@ -111,13 +120,27 @@ def move_to_done(src: Path, dst_dir: Path):
         base, ext = os.path.splitext(src.name)
         dst = dst_dir / f"{base}_{int(time.time())}{ext}"
     shutil.move(str(src), str(dst))
-    print(f"[MV ] {src.name} -> {dst}")
+    print(f"[MOVE] {src.name} -> {dst.name}")
 
-# ----------------- aapt2 解析 -----------------
+def write_json(p: Path, obj: dict):
+    ensure_dir(p.parent)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def write_text(p: Path, s: str):
+    ensure_dir(p.parent)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(s)
+
+def safe_remove(p: Path):
+    try:
+        os.remove(str(p))
+    except Exception:
+        pass
+
+# ================== aapt2 解析与图标抽取 ==================
 def parse_aapt(apk_path: str) -> dict:
-    """
-    aapt2 dump badging，抓取 package / label / icon / permissions
-    """
+    """aapt2 dump badging，抓取 package / label / icon / permissions"""
     out = run_cmd([AAPT2_PATH, "dump", "badging", apk_path])
     info = {"package": "", "label": "", "icon": "", "permissions": []}
     for line in out.splitlines():
@@ -130,7 +153,7 @@ def parse_aapt(apk_path: str) -> dict:
             info["label"] = line.split(":", 1)[1].strip().strip("'")
         elif line.startswith("application-icon-"):
             dpi_path = line.split(":", 1)[1].strip().strip("'")
-            info["icon"] = dpi_path  # 最后一个通常是更高 dpi
+            info["icon"] = dpi_path  # 通常后出现的为更高 dpi
         elif line.startswith("icon="):
             try:
                 dpi_path = line.split("icon='")[1].split("'")[0]
@@ -140,15 +163,16 @@ def parse_aapt(apk_path: str) -> dict:
                 pass
         elif line.startswith("uses-permission:"):
             perm = line.split(":", 1)[1].strip().strip("'")
-            info["permissions"].append(perm)
+            if perm:
+                info["permissions"].append(perm)
     return info
 
 def parse_iconfile_in_resource(entry_name: str, resources_output: str) -> List[List[str]]:
     """
-    在 aapt2 dump resources 输出中，找到 entry 的 (file) 行，收集具体资源文件路径。
-    返回 [[原行, 路径], ...]，并只收 .png/.webp/.jpg
+    在 aapt2 dump resources 输出中，找到 entry 的 (file) 行，收集资源文件路径。
+    返回 [[原行, 路径], ...]；仅收 .png/.webp/.jpg/.jpeg
     """
-    resolved = []
+    resolved: List[List[str]] = []
     capture = False
     for raw in resources_output.splitlines():
         line = raw.strip()
@@ -160,7 +184,8 @@ def parse_iconfile_in_resource(entry_name: str, resources_output: str) -> List[L
                 if "(file)" in line:
                     try:
                         path = line.split("(file)")[1].strip().split()[0]
-                        if (".png" in path) or (".webp" in path) or (".jpg" in path) or (".jpeg" in path):
+                        lo = path.lower()
+                        if any(ext in lo for ext in [".png", ".webp", ".jpg", ".jpeg"]):
                             resolved.append([line, path])
                     except Exception:
                         continue
@@ -169,24 +194,19 @@ def parse_iconfile_in_resource(entry_name: str, resources_output: str) -> List[L
     return resolved
 
 def resolve_icon_from_xml_with_aapt2(apk_path: str, xml_path_in_apk: str) -> List[List[str]]:
-    """
-    通过 aapt2 dump resources，将 XML icon 解析到实际的文件资源路径列表。
-    优先返回包含 mdpi 的项作为“默认”。
-    """
+    """通过 aapt2 dump resources，将 XML icon 解析到实际文件资源路径列表。"""
     res_out = run_cmd([AAPT2_PATH, "dump", "resources", apk_path])
+
     entry_name = None
-    current_block = []
+    current_block: List[str] = []
     inside = False
 
-    # 第一次扫描：找到包含该 xml 的 resource block 名称
     for raw in res_out.splitlines():
         line = raw.strip()
         if line.startswith("resource"):
-            # 进入新 block，先判断旧 block 是否包含目标
             if inside and entry_name and current_block:
                 if any(xml_path_in_apk in r for r in current_block):
-                    break
-                # 重置
+                    break  # 命中
                 entry_name = None
                 current_block = []
             entry_name = line.split()[-1]
@@ -196,7 +216,6 @@ def resolve_icon_from_xml_with_aapt2(apk_path: str, xml_path_in_apk: str) -> Lis
             current_block.append(line)
 
     if not entry_name:
-        print("[-] resolve: failed to locate resource entry for", xml_path_in_apk)
         return []
 
     paths = parse_iconfile_in_resource(entry_name, res_out)
@@ -205,23 +224,17 @@ def resolve_icon_from_xml_with_aapt2(apk_path: str, xml_path_in_apk: str) -> Lis
         paths = parse_iconfile_in_resource("mipmap/ic_launcher", res_out)
     return paths
 
-# ----------------- 图标提取 + 命名 -----------------
 def pick_default_icon_path(items: List[List[str]]) -> Optional[str]:
-    """
-    传入 [[line, path], ...]，优先返回包含 'mdpi' 的 path；若无，返回第一项的 path。
-    """
+    """优先返回包含 'mdpi' 的 path；否则第一项"""
     if not items:
         return None
-    # 优先 mdpi
     for line, p in items:
         if "mdpi" in line:
             return p
     return items[0][1]
 
 def extract_file_from_apk(apk_path: str, inner_path: str, out_file: Path) -> bool:
-    """
-    从 APK (zip) 中提取 inner_path 到 out_file。
-    """
+    """从 APK(Zip) 里提取 inner_path 到 out_file。"""
     try:
         with zipfile.ZipFile(apk_path, "r") as zf:
             if inner_path not in zf.namelist():
@@ -240,37 +253,28 @@ def sha256_of_file(p: Path) -> str:
     with open(p, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
-    return h.hexdigest()  # 小写 hex
+    return h.hexdigest()
 
-# ----------------- 单个 hash 的处理 -----------------
-def process_one_hash(client: Path, h: str) -> Optional[dict]:
+# ================== 单个 hash 处理 ==================
+def process_one_hash(client: Path, h: str) -> Tuple[str, str, str, str]:
     """
-    下载 -> 解析 aapt2 -> 拿 devid -> 解析图标 -> 提取默认图标 -> 以 sha256 命名放入 uploadimages -> 返回 request JSON dict
-    返回的 dict 形如：
-    {
-      "hash": "...",
-      "package": "...",
-      "label": "...",
-      "icon_filename": "<sha256>.<ext>",
-      "devid": "...",
-      "permissions": "perm1;perm2;perm3"
-    }
-    若失败，返回 None（继续下一个 hash）
+    下载 -> aapt2 -> devid -> 解析并提取 icon(默认 mdpi 或首个) -> 生成 request/<hash>.json
+    返回四元组：(hash, icon_filename, status, reason)
+      - status ∈ {"success_ready", "info_only", "failed"}
+      - reason：失败/降级原因描述（成功时空字符串）
     """
+    pkg_file: Optional[Path] = None
     try:
         pkg_file = run_client_download(client, h, DIR_DOWNLOAD)
     except Exception as e:
-        print(f"[ERR] hash={h} download: {e}")
-        return None
+        return (h, "", "failed", f"download_failed:{e}")
 
     apk_path = str(pkg_file)
     try:
         info = parse_aapt(apk_path)
     except Exception as e:
-        print(f"[ERR] aapt2 badging failed: {apk_path}: {e}")
-        # 清理下载文件
         safe_remove(pkg_file)
-        return None
+        return (h, "", "failed", f"aapt2_badging_failed:{e}")
 
     package = info.get("package", "") or ""
     label   = info.get("label", "") or ""
@@ -278,7 +282,6 @@ def process_one_hash(client: Path, h: str) -> Optional[dict]:
     perms   = info.get("permissions", []) or []
     perms_str = ";".join([p for p in perms if p])
 
-    # devid
     devid = ""
     try:
         devid, _ = getsignsha1(apk_path)
@@ -286,41 +289,41 @@ def process_one_hash(client: Path, h: str) -> Optional[dict]:
         print(f"[WARN] getsignsha1 failed: {e}")
 
     # 解析图标真实路径
-    icon_path_in_apk = None
+    icon_path_in_apk: Optional[str] = None
     if iconref.endswith(".xml"):
-        items = []
+        items: List[List[str]] = []
         try:
             items = resolve_icon_from_xml_with_aapt2(apk_path, iconref)
         except Exception as e:
             print(f"[WARN] resolve icon xml failed: {e}")
-        picked = pick_default_icon_path(items)
-        icon_path_in_apk = picked
+        icon_path_in_apk = pick_default_icon_path(items)
     else:
-        icon_path_in_apk = iconref
+        icon_path_in_apk = iconref if iconref else None
 
-    icon_filename = ""  # 最终写入 request JSON 的名字
+    icon_filename = ""
     if icon_path_in_apk:
-        # 提取到临时文件，计算 sha256，移动并命名
         ext = os.path.splitext(icon_path_in_apk)[1].lower()
         if ext not in [".png", ".webp", ".jpg", ".jpeg"]:
-            # 不识别的扩展名默认 .png
             ext = ".png"
-
         tmp_out = DIR_DOWNLOAD / f"__icon_tmp_{h}{ext}"
         ok = extract_file_from_apk(apk_path, icon_path_in_apk, tmp_out)
-        if not ok:
-            print(f"[WARN] icon inner path not found: {icon_path_in_apk}")
-        else:
-            digest = sha256_of_file(tmp_out)  # 小写 hex
+        if ok:
+            digest = sha256_of_file(tmp_out)
+            # 统一扩展名（把 .jpeg 也归并成 .jpg）
+            if ext == ".jpeg":
+                ext = ".jpg"
             final_name = f"{digest}{ext}"
             final_path = DIR_UPLOADIMAGES / final_name
             ensure_dir(DIR_UPLOADIMAGES)
-            # 覆盖或跳过：这里选择幂等覆盖（若同内容相同哈希则一样）
+            if final_path.exists():
+                os.remove(str(final_path))
             shutil.move(str(tmp_out), str(final_path))
             icon_filename = final_name
-            print(f"[ICON] saved -> {final_path}")
+            print(f"[ICON] {h} -> {final_name}")
+        else:
+            print(f"[WARN] icon inner path not found: {icon_path_in_apk}")
 
-    # 生成 request JSON 结构
+    # 生成 request JSON（icon_filename 可能为空）
     req_obj = {
         "hash": h,
         "package": package,
@@ -329,70 +332,202 @@ def process_one_hash(client: Path, h: str) -> Optional[dict]:
         "devid": devid,
         "permissions": perms_str
     }
-
-    # 写到 ./request/<hash>.json
-    ensure_dir(DIR_REQUEST_OUT)
     req_path = DIR_REQUEST_OUT / f"{h}.json"
     write_json(req_path, req_obj)
-    print(f"[OUT] request json -> {req_path}")
+    print(f"[REQ ] write -> {req_path.name}")
 
-    # 清理下载文件
+    # 清理下载件
     safe_remove(pkg_file)
 
-    return req_obj
+    if icon_filename:
+        return (h, icon_filename, "success_ready", "")
+    else:
+        return (h, "", "info_only", "no_icon_extracted")
 
-def write_json(p: Path, obj: dict):
-    import json
-    ensure_dir(p.parent)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# ================== 结果探测 ==================
+def result_exists_for_hash(h: str) -> bool:
+    """inforesults/<hash>.json 或 bakinforesults/<hash>.json 是否存在"""
+    return (DIR_INFORESULTS / f"{h}.json").exists() or (DIR_BAKINFORESULTS / f"{h}.json").exists()
 
-def safe_remove(p: Path):
-    try:
-        os.remove(str(p))
-    except Exception:
-        pass
+def result_exists_for_icon(icon_filename: str) -> bool:
+    """imageresults/<icon>.json 或 bakimageresults/<icon>.json 是否存在"""
+    return (DIR_IMAGERESULTS / f"{icon_filename}.json").exists() or (DIR_BAKIMAGERESULTS / f"{icon_filename}.json").exists()
 
-# ----------------- 处理一个 txt -----------------
-def process_txt(txt: Path, client: Path):
-    print(f"[PROC] {txt.name}")
+# ================== 批次状态与监控 ==================
+@dataclass
+class BatchState:
+    name: str                              # 原始 txt 文件名（含扩展名）
+    path: Path                             # 原始 txt 路径（requestbyhash/ 下）
+    start_ts: float
+    all_hashes: List[str]
+    # 分类
+    success_ready: List[Tuple[str, str]] = field(default_factory=list)  # [(hash, icon_filename)]
+    info_only: List[str] = field(default_factory=list)                  # [hash]
+    failed: List[Tuple[str, str]] = field(default_factory=list)         # [(hash, reason)]
+    # 监控表：仅可监控项
+    remaining: Dict[str, str] = field(default_factory=dict)             # {hash: icon_filename}
+
+active_batches: Dict[str, BatchState] = {}  # key = txt.stem
+
+def build_summary_text(original_txt: str,
+                       success_hashes: List[str],
+                       pending_hashes: List[str],
+                       info_only_hashes: List[str],
+                       failed_hashes: List[Tuple[str, str]],
+                       all_hashes: List[str],
+                       success_ready_pairs: List[Tuple[str, str]]) -> str:
+    lines: List[str] = []
+    lines.append(f"SUMMARY FOR: {original_txt}")
+    lines.append(f"TOTAL HASHES: {len(all_hashes)}")
+    lines.append("")
+    lines.append(f"[SUCCESS COMPLETED] ({len(success_hashes)})")
+    for h in success_hashes:
+        # 找到对应 icon
+        icon = ""
+        for hh, ic in success_ready_pairs:
+            if hh == h:
+                icon = ic
+                break
+        lines.append(f"  - {h}  icon={icon}")
+    lines.append("")
+    lines.append(f"[PENDING_OR_TIMEOUT] ({len(pending_hashes)})")
+    for h in pending_hashes:
+        # 也补 icon 以便排查
+        icon = ""
+        for hh, ic in success_ready_pairs:
+            if hh == h:
+                icon = ic
+                break
+        lines.append(f"  - {h}  icon={icon}")
+    lines.append("")
+    lines.append(f"[INFO_ONLY_NO_ICON] ({len(info_only_hashes)})")
+    for h in info_only_hashes:
+        lines.append(f"  - {h}")
+    lines.append("")
+    lines.append(f"[FAILED_EARLY] ({len(failed_hashes)})")
+    for h, why in failed_hashes:
+        lines.append(f"  - {h}  reason={why}")
+    lines.append("")
+    lines.append("NOTE:")
+    lines.append("  SUCCESS COMPLETED: inforesults/<hash>.json & imageresults/<icon>.json are both present (or in bak*).")
+    lines.append("  PENDING_OR_TIMEOUT: missing either inforesult or imageresult when batch finalized.")
+    lines.append("  INFO_ONLY_NO_ICON: request json generated but icon could not be extracted, so no image result expected.")
+    lines.append("  FAILED_EARLY: download or parsing failed; no request was monitored.")
+    return "\n".join(lines)
+
+def process_txt_start(txt: Path, client: Path):
+    name = txt.stem
     hashes = read_hashes_from_txt(txt)
-    if not hashes:
-        print(f"[WARN] empty txt: {txt}")
-        return
+    bs = BatchState(
+        name=txt.name,
+        path=txt,
+        start_ts=time.time(),
+        all_hashes=hashes
+    )
 
     for h in hashes:
         try:
-            process_one_hash(client, h)
+            hash_, icon_filename, status, reason = process_one_hash(client, h)
+            if status == "success_ready" and icon_filename:
+                bs.success_ready.append((hash_, icon_filename))
+            elif status == "info_only":
+                bs.info_only.append(hash_)
+            else:
+                bs.failed.append((hash_, reason))
         except Exception as e:
-            # 默认 continue-on-error
-            print(f"[ERR] process hash={h}: {e}")
+            bs.failed.append((h, f"exception:{e}"))
 
-# ----------------- 主循环 -----------------
+    bs.remaining = {h: icon for (h, icon) in bs.success_ready}
+    active_batches[name] = bs
+    print(f"[ENQUEUE] batch={name}: watch={len(bs.remaining)} info_only={len(bs.info_only)} failed={len(bs.failed)}")
+
+def tick_monitor():
+    if not active_batches:
+        return
+    now = time.time()
+    done_names: List[str] = []
+
+    for name, bs in list(active_batches.items()):
+        # 更新可监控剩余项
+        finished_now: List[str] = []
+        for h, icon in list(bs.remaining.items()):
+            has_info  = result_exists_for_hash(h)
+            has_image = result_exists_for_icon(icon)
+            if has_info and has_image:
+                finished_now.append(h)
+        for h in finished_now:
+            bs.remaining.pop(h, None)
+
+        # 完成或超时则收尾
+        timeout = (now - bs.start_ts) > MAX_WAIT_SECONDS
+        if not bs.remaining or timeout:
+            completed = [h for (h, _) in bs.success_ready if h not in bs.remaining]
+            pending   = list(bs.remaining.keys())
+
+            summary = build_summary_text(
+                original_txt=bs.name,
+                success_hashes=completed,
+                pending_hashes=pending,
+                info_only_hashes=bs.info_only,
+                failed_hashes=bs.failed,
+                all_hashes=bs.all_hashes,
+                success_ready_pairs=bs.success_ready
+            )
+            out_summary = DIR_REQUEST_BY_HASH_DONE / f"{Path(bs.name).stem}_summary.txt"
+            write_text(out_summary, summary)
+            print(f"[OUT ] summary -> {out_summary.name}")
+
+            # 移动原始 txt 到 done
+            move_to_done(bs.path, DIR_REQUEST_BY_HASH_DONE)
+
+            done_names.append(name)
+
+    for nm in done_names:
+        active_batches.pop(nm, None)
+
+# ================== 主循环 ==================
 def main():
-    print("=== Request-By-Hash Watcher ===")
-    for d in [DIR_REQUEST_BY_HASH, DIR_REQUEST_BY_HASH_DONE, DIR_REQUEST_OUT, DIR_UPLOADIMAGES, DIR_DOWNLOAD]:
+    print("=== Enhanced Non-blocking Request-By-Hash Watcher ===")
+    for d in [
+        DIR_REQUEST_BY_HASH, DIR_REQUEST_BY_HASH_DONE,
+        DIR_REQUEST_OUT, DIR_UPLOADIMAGES, DIR_DOWNLOAD,
+        DIR_INFORESULTS, DIR_BAKINFORESULTS, DIR_IMAGERESULTS, DIR_BAKIMAGERESULTS
+    ]:
         ensure_dir(d)
 
     client = ensure_client()
-    print(f"[INIT] using client: {client}")
+    print(f"[INIT] client: {client}")
 
-    seen = set()  # type: Set[Path]
-    print(f"[WATCH] {DIR_REQUEST_BY_HASH.resolve()}")
+    seen: Set[Path] = set()
+    print(f"[WATCH] {DIR_REQUEST_BY_HASH.resolve()} (poll={POLL_INTERVAL}s)")
 
     while True:
         try:
+            # 发现新 txt：启动批次（不阻塞）
             new_txts = stable_new_txts(DIR_REQUEST_BY_HASH, seen)
             if new_txts:
-                print(f"[DETECT] {len(new_txts)} new txt: {[p.name for p in new_txts]}")
-
+                print(f"[DETECT] new txt: {[p.name for p in new_txts]}")
             for txt in new_txts:
                 seen.add(txt)
                 try:
-                    process_txt(txt, client)
-                finally:
-                    # 不论成功失败，移动到 done 目录（避免卡死/阻塞）
+                    process_txt_start(txt, client)
+                except Exception as e:
+                    # 出错也给出最小化 summary，并把原始 txt 移到 done
+                    print(f"[FATAL] start batch failed: {txt.name}: {e}")
+                    summary = build_summary_text(
+                        original_txt=txt.name,
+                        success_hashes=[],
+                        pending_hashes=[],
+                        info_only_hashes=[],
+                        failed_hashes=[("BATCH_EXCEPTION", str(e))],
+                        all_hashes=read_hashes_from_txt(txt),
+                        success_ready_pairs=[]
+                    )
+                    write_text(DIR_REQUEST_BY_HASH_DONE / f"{txt.stem}_summary.txt", summary)
                     move_to_done(txt, DIR_REQUEST_BY_HASH_DONE)
+
+            # 统一监控所有活跃批次
+            tick_monitor()
 
             time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
