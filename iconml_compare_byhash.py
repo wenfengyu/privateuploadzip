@@ -496,12 +496,12 @@ def tick_monitor():
                 all_hashes=bs.all_hashes,
                 success_ready_pairs=bs.success_ready
             )
-            out_summary = DIR_REQUEST_BY_HASH_DONE / f"{Path(bs.name).stem}_summary.txt"
-            write_text(out_summary, summary)
-            print(f"[OUT ] summary -> {out_summary.name}")
+            out_txt = DIR_REQUEST_BY_HASH_DONE / bs.name
+            write_text(out_txt, summary)
+            print(f"[OUT ] done -> {out_txt.name}")
 
-            # 移动原始 txt 到 done
-            move_to_done(bs.path, DIR_REQUEST_BY_HASH_DONE)
+            # 2) 避免目录内重名：既然已在 done 目录生成了同名汇总，就删除源 txt
+            safe_remove(bs.path)
 
             done_names.append(name)
 
