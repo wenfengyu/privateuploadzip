@@ -36,6 +36,8 @@ LOCAL_DIR_ADDSAMPLEPROCESSED   = "addsampleprocessed"
 LOCAL_DIR_REQUESTBYHASH        = "requestbyhash"
 LOCAL_DIR_REQUESTBYHASHDONE    = "requestbyhashdone"
 
+LOCAL_DIR_BAKREQUESTBYHASHDONE = "bakrequestbyhashdone"
+
 POLL_S3_INTERVAL    = 2.0
 POLL_LOCAL_INTERVAL = 1.0
 STABLE_WAIT_SEC     = 0.2
@@ -54,7 +56,8 @@ for d in [
     LOCAL_DIR_RESULTS, LOCAL_DIR_IMAGERESULTS,
     LOCAL_DIR_BAKRESULTS, LOCAL_DIR_BAKIMAGERESULTS,
     LOCAL_DIR_ADDSAMPLES, LOCAL_DIR_ADDSAMPLEPROCESSED,
-    LOCAL_DIR_REQUESTBYHASH, LOCAL_DIR_REQUESTBYHASHDONE
+    LOCAL_DIR_REQUESTBYHASH, LOCAL_DIR_REQUESTBYHASHDONE,
+    LOCAL_DIR_BAKREQUESTBYHASHDONE,  # <<< 新增
 ]:
     os.makedirs(d, exist_ok=True)
 
@@ -375,31 +378,52 @@ def _try_enqueue_request_task_from_local_request_json():
 def scan_and_handle_local_requestbyhashdone():
     """
     监控本地 ./requestbyhashdone/：
-      - 若出现与 pending_requestbyhash 同名的 .txt，则视为整批完成（即便有 hash 失败也不阻塞），
-        将 S3 上 requestbyhash/<txt> 移动到 requestbyhashdone/<txt> 并出队。
+      - 若出现与 pending_requestbyhash 同名的 .txt，则：
+        1) 将本地 txt 上传到 S3: requestbyhashdone/<txt>
+        2) 删除 S3: requestbyhash/<txt>（若存在）
+        3) 本地 txt 移动到 bakrequestbyhashdone/
+        4) 出队，并清理该 txt 关联的 hash 映射
     """
     if not pending_requestbyhash:
         return
+
     need_names = set(pending_requestbyhash.keys())
     for fname in os.listdir(LOCAL_DIR_REQUESTBYHASHDONE):
         if not fname.endswith(".txt"):
             continue
         if fname not in need_names:
             continue
+
         local_path = os.path.join(LOCAL_DIR_REQUESTBYHASHDONE, fname)
         if not file_is_stable(local_path):
             continue
 
-        s3_src_key = pending_requestbyhash.get(fname)
+        # 目标 S3 路径
         s3_dst_key = S3_PREFIX_REQUESTBYHASHDONE + fname
+        # 源（等待删除）的 S3 路径
+        s3_src_key = pending_requestbyhash.get(fname)
+
+        # 1) 上传本地 txt 到 S3 requestbyhashdone/
         try:
-            s3_move(BUCKET, s3_src_key, s3_dst_key)
-            logging.info(f"[S3 MOVE][RBH] {s3_src_key} -> {s3_dst_key}")
+            s3_upload(BUCKET, s3_dst_key, local_path)
+            logging.info(f"[S3 UP][RBH] local {local_path} -> s3://{BUCKET}/{s3_dst_key}")
         except ClientError as e:
-            logging.error(f"Move S3 requestbyhash -> requestbyhashdone failed: {s3_src_key}, err={e}")
+            logging.error(f"Upload local requestbyhashdone -> S3 failed: {local_path} -> {s3_dst_key}, err={e}")
+            # 上传失败则先别删源 S3
             continue
 
-        # 出队 + 清理该 txt 下的 hash 映射（可选）
+        # 2) 删除 S3 requestbyhash/<txt> （若存在）
+        if s3_src_key:
+            try:
+                s3_delete(BUCKET, s3_src_key)
+                logging.info(f"[S3 DEL][RBH] s3://{BUCKET}/{s3_src_key}")
+            except ClientError as e:
+                logging.warning(f"Delete S3 requestbyhash src warn: {s3_src_key}, err={e}")
+
+        # 3) 本地文件归档到 bakrequestbyhashdone/
+        move_local(local_path, LOCAL_DIR_BAKREQUESTBYHASHDONE)
+
+        # 4) 出队 + 清理映射
         pending_requestbyhash.pop(fname, None)
         # 移除 rbh_hash_to_txt 中属于该 txt 的所有 hash
         for h in [h for h, tname in list(rbh_hash_to_txt.items()) if tname == fname]:
